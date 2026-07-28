@@ -1,0 +1,145 @@
+/// yeh wala single scan kae liye hai -----------------------------------///
+
+import requests
+
+requests.packages.urllib3.disable_warnings()
+
+WAF_SIGNATURES = {
+    'Cloudflare': ['cf-ray', 'server: cloudflare'],
+    'Akamai': ['akamaighost', 'x-akamai'],
+    'AWS WAF': ['x-amzn-requestid', 'x-amz-cf-id'],
+    'Azure WAF': ['x-azure-ref'],
+    'Sucuri': ['x-sucuri-id', 'sucuri/cloudproxy'],
+    'Imperva/Incapsula': ['incap_ses', 'x-iinfo'],
+    'F5': ['x-waf-event-info', 'bigipserver'],
+    'FortiWeb': ['fortiwafsid'],
+    'Barracuda': ['barra_counter_session'],
+}
+
+target = input("Enter IP or URL: ").strip()
+
+if not target.startswith('http'):
+    target = 'https://' + target
+
+try:
+    resp = requests.get(target, timeout=5, verify=False)
+    header_str = str(resp.headers).lower()
+
+    detected = [waf for waf, sigs in WAF_SIGNATURES.items() if any(s in header_str for s in sigs)]
+
+    print(f"\nTarget      : {target}")
+    print(f"Status code : {resp.status_code}")
+    if detected:
+        print(f"WAF Enabled : Yes ({', '.join(detected)})")
+    else:
+        print("WAF Enabled : No known signature detected")
+
+except requests.RequestException as e:
+    print(f"\nError reaching target: {e}")
+
+
+
+
+
+///// Yeh wala file sacan kae liye hai ------------------------------------------------------------------///
+
+import sys
+import pandas as pd
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+requests.packages.urllib3.disable_warnings()
+
+WAF_SIGNATURES = {
+    'Cloudflare': ['cf-ray', 'server: cloudflare'],
+    'Akamai': ['akamaighost', 'x-akamai'],
+    'AWS WAF': ['x-amzn-requestid', 'x-amz-cf-id'],
+    'Azure WAF': ['x-azure-ref'],
+    'Sucuri': ['x-sucuri-id', 'sucuri/cloudproxy'],
+    'Imperva/Incapsula': ['incap_ses', 'x-iinfo'],
+    'F5': ['x-waf-event-info', 'bigipserver'],
+    'FortiWeb': ['fortiwafsid'],
+    'Barracuda': ['barra_counter_session'],
+}
+
+MAX_WORKERS = 20  # parallel requests -> speed
+
+
+def find_target_column(df):
+    """Auto-detect the column containing IP/URL, or fall back to the first column."""
+    candidates = ['ip', 'url', 'ip/url', 'ip_url', 'target', 'host', 'hostname', 'website', 'domain']
+    for col in df.columns:
+        if str(col).strip().lower() in candidates:
+            return col
+    return df.columns[0]
+
+
+def scan_one(raw_target):
+    raw_target = str(raw_target).strip()
+    if not raw_target or raw_target.lower() == 'nan':
+        return None
+
+    url = raw_target if raw_target.startswith('http') else 'https://' + raw_target
+
+    try:
+        resp = requests.get(url, timeout=6, verify=False)
+        header_str = str(resp.headers).lower()
+        detected = [waf for waf, sigs in WAF_SIGNATURES.items() if any(s in header_str for s in sigs)]
+        return {
+            'Target': raw_target,
+            'Status_Code': resp.status_code,
+            'WAF_Enabled': 'Yes' if detected else 'No',
+            'WAF_Vendor': ', '.join(detected) if detected else '-',
+            'Error': ''
+        }
+    except requests.RequestException as e:
+        return {
+            'Target': raw_target,
+            'Status_Code': '',
+            'WAF_Enabled': 'Unknown',
+            'WAF_Vendor': '-',
+            'Error': str(e)[:150]
+        }
+
+
+def main(input_path, output_path='waf_scan_results.xlsx'):
+    if input_path.lower().endswith('.csv'):
+        df = pd.read_csv(input_path)
+    else:
+        df = pd.read_excel(input_path)
+
+    col = find_target_column(df)
+    targets = df[col].dropna().tolist()
+    print(f"Loaded {len(targets)} targets from column '{col}'. Scanning with {MAX_WORKERS} parallel workers...")
+
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(scan_one, t): t for t in targets}
+        done_count = 0
+        for future in as_completed(futures):
+            r = future.result()
+            if r:
+                results.append(r)
+            done_count += 1
+            print(f"  [{done_count}/{len(targets)}] scanned", end='\r')
+
+    print(f"\nDone. {len(results)} results collected.")
+
+    result_df = pd.DataFrame(results)
+
+    if output_path.lower().endswith('.csv'):
+        result_df.to_csv(output_path, index=False)
+    else:
+        result_df.to_excel(output_path, index=False)
+
+    print(f"Saved -> {output_path}")
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print("Usage: python waf_bulk_scan.py <input_file.xlsx or .csv> [output_file.xlsx or .csv]")
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else 'waf_scan_results.xlsx'
+    main(input_file, output_file)
