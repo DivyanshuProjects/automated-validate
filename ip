@@ -1,0 +1,149 @@
+"""
+URL -> IP Lookup Script
+------------------------
+Excel (.xlsx) ya CSV (.csv) file mein diye gaye ek column ke saare URLs ko
+resolve karke unka IP address nikalta hai, aur result ko naye column ke
+saath output file mein save kar deta hai.
+
+USAGE (terminal / cmd se):
+    python url_to_ip.py --input "C:/path/to/input.xlsx" --column "URL" --output "C:/path/to/output.xlsx"
+
+Agar --output nahi doge, to automatically "<input_name>_with_ip.xlsx" (ya .csv)
+banake usi folder mein save kar dega.
+
+ARGUMENTS:
+    --input   : Input file ka path (.xlsx ya .csv)   [REQUIRED]
+    --column  : Jis column mein URLs hain uska naam    [REQUIRED]
+    --output  : Output file ka path (.xlsx ya .csv)   [OPTIONAL]
+    --sheet   : Agar xlsx mein multiple sheets hain, to sheet ka naam [OPTIONAL]
+    --workers : Ek saath kitne URLs resolve karne hain (default 10)  [OPTIONAL]
+"""
+
+import argparse
+import socket
+import sys
+import re
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+
+
+def extract_hostname(url: str) -> str:
+    """URL se sirf hostname/domain nikalta hai (http://, https://, path, port sab hata deta hai)."""
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    url = url.strip()
+
+    # agar scheme (http:// ya https://) nahi hai to add kar do taaki parsing sahi ho
+    if "://" not in url:
+        url = "http://" + url
+
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = parsed.hostname
+        return host if host else ""
+    except Exception:
+        # fallback: regex se nikaal lo
+        match = re.search(r"://([^/:?#]+)", url)
+        return match.group(1) if match else url
+
+
+def resolve_ip(url: str) -> str:
+    """Ek URL/domain ka IP address return karta hai, error hone par error message deta hai."""
+    hostname = extract_hostname(url)
+    if not hostname:
+        return "INVALID_URL"
+    try:
+        ip = socket.gethostbyname(hostname)
+        return ip
+    except socket.gaierror:
+        return "RESOLVE_FAILED"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def read_input(input_path: Path, sheet: str | None) -> pd.DataFrame:
+    if input_path.suffix.lower() in (".xlsx", ".xlsm", ".xls"):
+        if sheet:
+            return pd.read_excel(input_path, sheet_name=sheet)
+        return pd.read_excel(input_path)
+    elif input_path.suffix.lower() in (".csv",):
+        return pd.read_csv(input_path)
+    elif input_path.suffix.lower() in (".tsv",):
+        return pd.read_csv(input_path, sep="\t")
+    else:
+        raise ValueError(f"Unsupported file type: {input_path.suffix}. Sirf .xlsx, .xls, .csv, .tsv chalega.")
+
+
+def write_output(df: pd.DataFrame, output_path: Path):
+    if output_path.suffix.lower() in (".xlsx", ".xlsm"):
+        df.to_excel(output_path, index=False)
+    elif output_path.suffix.lower() == ".csv":
+        df.to_csv(output_path, index=False)
+    elif output_path.suffix.lower() == ".tsv":
+        df.to_csv(output_path, index=False, sep="\t")
+    else:
+        raise ValueError(f"Unsupported output file type: {output_path.suffix}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Excel/CSV mein diye URLs ka IP address nikalne wala script.")
+    parser.add_argument("--input", required=True, help="Input file ka path (.xlsx ya .csv)")
+    parser.add_argument("--column", required=True, help="URLs wale column ka naam")
+    parser.add_argument("--output", required=False, help="Output file ka path (.xlsx ya .csv)")
+    parser.add_argument("--sheet", required=False, default=None, help="Excel sheet ka naam (agar zaroorat ho)")
+    parser.add_argument("--workers", type=int, default=10, help="Parallel lookups ki sankhya (default: 10)")
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"[ERROR] File nahi mili: {input_path}")
+        sys.exit(1)
+
+    print(f"[INFO] Reading: {input_path}")
+    try:
+        df = read_input(input_path, args.sheet)
+    except Exception as e:
+        print(f"[ERROR] File read nahi ho payi: {e}")
+        sys.exit(1)
+
+    if args.column not in df.columns:
+        print(f"[ERROR] Column '{args.column}' nahi mila. Available columns: {list(df.columns)}")
+        sys.exit(1)
+
+    urls = df[args.column].tolist()
+    total = len(urls)
+    print(f"[INFO] Total {total} URLs mile. Resolving IPs (parallel workers={args.workers})...")
+
+    results = [None] * total
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_to_idx = {executor.submit(resolve_ip, url): idx for idx, url in enumerate(urls)}
+        done_count = 0
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            results[idx] = future.result()
+            done_count += 1
+            if done_count % 25 == 0 or done_count == total:
+                print(f"[INFO] {done_count}/{total} resolved...")
+
+    df["IP_Address"] = results
+
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = input_path.with_name(input_path.stem + "_with_ip" + (input_path.suffix if input_path.suffix.lower() != ".xls" else ".xlsx"))
+
+    print(f"[INFO] Saving output: {output_path}")
+    try:
+        write_output(df, output_path)
+    except Exception as e:
+        print(f"[ERROR] Output save nahi ho paya: {e}")
+        sys.exit(1)
+
+    print(f"[DONE] Result save ho gaya: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
