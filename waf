@@ -1,0 +1,338 @@
+"""
+Advanced WAF / CDN Passive Detection Tool
+==========================================
+Improvements over the basic single-URL version:
+  1. BULK INPUT -> Accepts .xlsx/.csv, shows you the columns found, and asks
+                   which column has the URL/IP (interactive prompt)
+  2. SPEED       -> Concurrent requests using ThreadPoolExecutor
+  3. ACCURACY:
+       - Expanded signature list (more WAF/CDN providers, more header
+         patterns) with a "confidence" score based on how many independent
+         signals matched
+       - Checks response headers AND common CDN cookie names
+       - Retry logic + realistic User-Agent (fewer false negatives)
+  4. REPORT      -> Color-coded Excel output + a summary sheet with counts
+
+Install requirements:
+    pip install pandas requests openpyxl tqdm --break-system-packages
+
+Usage:
+    python waf_cdn_audit_advanced.py
+    (it will then prompt you for the file path and target column)
+
+    OR for a single URL, quick check:
+    python waf_cdn_audit_advanced.py --single
+"""
+
+import os
+import re
+import sys
+import concurrent.futures as cf
+
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter, Retry
+from tqdm import tqdm
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+
+# ----------------------------- CONFIG -----------------------------
+OUTPUT_FILE = "waf_cdn_audit_results.xlsx"
+MAX_WORKERS = 10
+REQUEST_TIMEOUT = 10
+RETRIES = 2
+
+HEADERS_UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+# ------------------------- SIGNATURE RULES -------------------------
+# Each provider: list of (check_fn) -> bool. More matches = higher confidence.
+def has_header(headers: dict, *names) -> bool:
+    return any(n in headers for n in names)
+
+
+def header_contains(headers: dict, needle: str) -> bool:
+    return needle.lower() in str(headers).lower()
+
+
+def cookie_contains(cookies, needle: str) -> bool:
+    return any(needle.lower() in c.lower() for c in cookies.keys())
+
+
+PROVIDER_CHECKS = {
+    "Cloudflare": lambda h, c, srv: [
+        has_header(h, "cf-ray", "cf-mitigated", "cf-cache-status"),
+        "cloudflare" in srv,
+        cookie_contains(c, "__cf"),
+    ],
+    "Akamai": lambda h, c, srv: [
+        has_header(h, "x-akamai-transformed", "akamai-origin-hop", "x-akamai-request-id"),
+        header_contains(h, "akamai"),
+        cookie_contains(c, "akamai") or cookie_contains(c, "ak_bmsc"),
+    ],
+    "Imperva / Incapsula": lambda h, c, srv: [
+        has_header(h, "x-iinfo", "x-cdn") and header_contains(h, "incap"),
+        header_contains(h, "incap"),
+        cookie_contains(c, "incap_ses") or cookie_contains(c, "visid_incap"),
+    ],
+    "Sucuri": lambda h, c, srv: [
+        has_header(h, "x-sucuri-id", "x-sucuri-cache"),
+        header_contains(h, "sucuri"),
+        "sucuri" in srv,
+    ],
+    "AWS CloudFront": lambda h, c, srv: [
+        has_header(h, "x-amz-cf-id", "x-amz-cf-pop"),
+        "cloudfront" in srv,
+    ],
+    "Fastly": lambda h, c, srv: [
+        header_contains(h, "fastly"),
+        has_header(h, "x-served-by", "x-fastly-request-id"),
+    ],
+    "Azure Front Door / WAF": lambda h, c, srv: [
+        has_header(h, "x-azure-ref", "x-fd-healthprobe"),
+        "azure" in srv,
+    ],
+    "F5 BIG-IP / ASM": lambda h, c, srv: [
+        header_contains(h, "bigip"),
+        cookie_contains(c, "bigipserver") or cookie_contains(c, "ts01"),
+    ],
+    "Google Cloud Armor / GFE": lambda h, c, srv: [
+        "gws" in srv or "google frontend" in srv,
+        has_header(h, "x-goog-request-id"),
+    ],
+    "StackPath": lambda h, c, srv: [
+        header_contains(h, "stackpath"),
+        has_header(h, "x-sp-edge"),
+    ],
+    "KeyCDN": lambda h, c, srv: [
+        "keycdn" in srv,
+        has_header(h, "x-edge-location"),
+    ],
+    "Barracuda WAF": lambda h, c, srv: [
+        cookie_contains(c, "barra_counter_session"),
+        header_contains(h, "barracuda"),
+    ],
+    "Wordfence (WP)": lambda h, c, srv: [
+        header_contains(h, "wordfence"),
+    ],
+}
+
+
+def build_session() -> requests.Session:
+    session = requests.Session()
+    retry_cfg = Retry(total=RETRIES, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry_cfg)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def detect_waf_cdn(headers: dict, cookies) -> tuple:
+    """Returns (detected_list_with_confidence, all_matched_signal_count)."""
+    srv = str(headers.get("server", "")).lower()
+    results = []
+    for provider, check_fn in PROVIDER_CHECKS.items():
+        signals = check_fn(headers, cookies, srv)
+        match_count = sum(1 for s in signals if s)
+        if match_count > 0:
+            confidence = "High" if match_count >= 2 else "Medium"
+            results.append(f"{provider} ({confidence})")
+    return results
+
+
+def check_url(raw_url: str) -> dict:
+    session = build_session()
+    url = raw_url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    row = {
+        "URL": raw_url,
+        "Status Code": "Error",
+        "Final URL": "",
+        "WAF/CDN Detected": "",
+        "Overall Confidence": "Unable to Check",
+        "Relevant Headers": "",
+        "Error": "",
+    }
+
+    try:
+        r = session.get(url, headers=HEADERS_UA, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        headers = {k.lower(): v for k, v in r.headers.items()}
+
+        detected = detect_waf_cdn(headers, r.cookies)
+
+        relevant = {
+            k: v for k, v in headers.items()
+            if any(x in k for x in [
+                "cf-", "akamai", "sucuri", "incap", "amz-cf", "fastly",
+                "azure", "bigip", "waf", "cdn", "via", "server", "goog",
+                "stackpath", "keycdn", "barracuda",
+            ])
+        }
+
+        overall_confidence = "Not Found"
+        if any("(High)" in d for d in detected):
+            overall_confidence = "High"
+        elif detected:
+            overall_confidence = "Medium"
+
+        row.update({
+            "Status Code": r.status_code,
+            "Final URL": r.url,
+            "WAF/CDN Detected": ", ".join(sorted(set(detected))) if detected else "None",
+            "Overall Confidence": overall_confidence,
+            "Relevant Headers": "; ".join(f"{k}: {v}" for k, v in relevant.items()),
+        })
+
+    except requests.RequestException as e:
+        row["Error"] = str(e)
+
+    return row
+
+
+def load_sheet(file_path: str) -> pd.DataFrame:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in (".xlsx", ".xls", ".xlsm"):
+        return pd.read_excel(file_path)
+    elif ext == ".csv":
+        return pd.read_csv(file_path)
+    else:
+        raise ValueError(f"Unsupported file type '{ext}'. Only .xlsx, .xls, .csv supported.")
+
+
+def prompt_for_file_path() -> str:
+    while True:
+        path = input("📂 Excel ya CSV file ka path daalo (e.g. urls.xlsx): ").strip().strip('"')
+        if not path:
+            print("   Path khaali nahi ho sakta, dobara try karo.\n")
+            continue
+        if not os.path.isfile(path):
+            print(f"   File nahi mili: '{path}'. Path check karke dobara try karo.\n")
+            continue
+        return path
+
+
+def prompt_for_column(df: pd.DataFrame) -> str:
+    print(f"\n📋 Sheet mein ye columns mile ({len(df)} rows):")
+    for i, col in enumerate(df.columns, start=1):
+        sample = ""
+        non_null = df[col].dropna()
+        if len(non_null) > 0:
+            sample = f"   (e.g. '{non_null.iloc[0]}')"
+        print(f"   {i}. {col}{sample}")
+
+    while True:
+        choice = input("\n🔎 Kaunsa column URL/IP wala hai? (naam ya number type karo): ").strip()
+        if not choice:
+            print("   Kuch to select karo.\n")
+            continue
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(df.columns):
+                return df.columns[idx]
+            print("   Ye number list mein nahi hai, dobara try karo.\n")
+            continue
+        matches = [c for c in df.columns if c.strip().lower() == choice.strip().lower()]
+        if matches:
+            return matches[0]
+        partial = [c for c in df.columns if choice.strip().lower() in c.strip().lower()]
+        if len(partial) == 1:
+            return partial[0]
+        print(f"   Column '{choice}' nahi mila. Column ka number ya poora naam try karo.\n")
+
+
+def style_output(path: str):
+    wb = load_workbook(path)
+    ws = wb.active
+
+    fills = {
+        "High": PatternFill("solid", fgColor="C6EFCE"),
+        "Medium": PatternFill("solid", fgColor="FFEB9C"),
+        "Not Found": PatternFill("solid", fgColor="FFC7CE"),
+        "Unable to Check": PatternFill("solid", fgColor="D9D9D9"),
+    }
+
+    header = [c.value for c in ws[1]]
+    conf_col_idx = header.index("Overall Confidence") + 1
+
+    counts = {}
+    for row in ws.iter_rows(min_row=2):
+        conf_val = row[conf_col_idx - 1].value
+        counts[conf_val] = counts.get(conf_val, 0) + 1
+        fill = fills.get(conf_val)
+        if fill:
+            for cell in row:
+                cell.fill = fill
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for i, col_name in enumerate(header, start=1):
+        max_len = max([len(str(col_name))] + [
+            len(str(ws.cell(row=r, column=i).value or "")) for r in range(2, ws.max_row + 1)
+        ])
+        ws.column_dimensions[get_column_letter(i)].width = min(max_len + 2, 60)
+
+    summary = wb.create_sheet("Summary")
+    summary.append(["Overall Confidence", "Count"])
+    summary["A1"].font = Font(bold=True)
+    summary["B1"].font = Font(bold=True)
+    for key, val in counts.items():
+        summary.append([key, val])
+
+    wb.save(path)
+
+
+def run_single_mode():
+    url = input("Enter URL: ").strip()
+    result = check_url(url)
+    print("\n================================")
+    print("WAF / CDN Passive Check")
+    print("================================")
+    for k, v in result.items():
+        print(f"{k:20}: {v}")
+
+
+def run_bulk_mode():
+    if len(sys.argv) > 1 and sys.argv[1] not in ("--single",):
+        file_path = sys.argv[1]
+        if not os.path.isfile(file_path):
+            print(f"File nahi mili: '{file_path}'")
+            file_path = prompt_for_file_path()
+    else:
+        file_path = prompt_for_file_path()
+
+    df = load_sheet(file_path)
+    if df.empty:
+        print("Sheet mein koi data nahi mila.")
+        return
+
+    url_column = prompt_for_column(df)
+    urls = df[url_column].dropna().tolist()
+    print(f"\n✅ '{url_column}' column se {len(urls)} URL/IP entries mili. Scan shuru ho raha hai...\n")
+
+    results = []
+    with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(check_url, u): u for u in urls}
+        for future in tqdm(cf.as_completed(futures), total=len(futures), desc="Scanning URLs"):
+            results.append(future.result())
+
+    result_df = pd.DataFrame(results)
+    result_df.to_excel(OUTPUT_FILE, index=False)
+    style_output(OUTPUT_FILE)
+
+    print(f"\nDone! {len(results)} URLs checked. Results saved to: {OUTPUT_FILE}")
+    print(result_df["Overall Confidence"].value_counts())
+
+
+if __name__ == "__main__":
+    if "--single" in sys.argv:
+        run_single_mode()
+    else:
+        run_bulk_mode()
