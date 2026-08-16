@@ -1,0 +1,115 @@
+"""
+URL Status Checker + Full Payload Downloader
+----------------------------------------------
+Sirf URL do -> status code check karega, redirect chain dikhayega,
+aur full response payload (HTML/JSON/whatever) ko file me save karega.
+
+USAGE (single URL):
+    python fetch_payload.py https://example.com
+
+USAGE (multiple URLs from a txt file, one per line):
+    python fetch_payload.py urls.txt
+
+Output:
+    payloads/<hostname>_<timestamp>.html   <- full raw response body
+    payloads/summary.csv                    <- status code, final URL, redirect chain, file saved
+"""
+
+import sys
+import os
+import csv
+import re
+from datetime import datetime
+from urllib.parse import urlparse
+import requests
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
+TIMEOUT = 15
+VERIFY_SSL = True
+OUTPUT_DIR = "payloads"
+
+
+def safe_filename(url: str) -> str:
+    host = urlparse(url).netloc or "unknown"
+    host = re.sub(r"[^a-zA-Z0-9._-]", "_", host)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{host}_{ts}"
+
+
+def fetch_and_save(url: str, writer):
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    print(f"\n→ Checking: {url}")
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                             allow_redirects=True, verify=VERIFY_SSL)
+    except requests.exceptions.SSLError as e:
+        print(f"  SSL Error: {e}")
+        writer.writerow([url, "SSL_ERROR", "", "", str(e)])
+        return
+    except requests.exceptions.ConnectionError as e:
+        print(f"  Connection Error: {e}")
+        writer.writerow([url, "CONN_ERROR", "", "", str(e)])
+        return
+    except requests.exceptions.Timeout:
+        print("  Timeout")
+        writer.writerow([url, "TIMEOUT", "", "", "Request timed out"])
+        return
+    except requests.exceptions.RequestException as e:
+        print(f"  Error: {e}")
+        writer.writerow([url, "ERROR", "", "", str(e)])
+        return
+
+    # Redirect chain
+    redirect_chain = " -> ".join([r.url for r in resp.history] + [resp.url])
+
+    print(f"  Status Code : {resp.status_code}")
+    print(f"  Final URL   : {resp.url}")
+    if resp.history:
+        print(f"  Redirects   : {len(resp.history)} hop(s)")
+        for r in resp.history:
+            print(f"    {r.status_code} -> {r.url}")
+
+    # Save full payload
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    fname = safe_filename(resp.url) + ".html"
+    fpath = os.path.join(OUTPUT_DIR, fname)
+    with open(fpath, "w", encoding="utf-8", errors="replace") as f:
+        f.write(resp.text)
+
+    print(f"  Payload saved -> {fpath}  ({len(resp.text):,} chars)")
+
+    writer.writerow([url, resp.status_code, resp.url, redirect_chain, fpath])
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python fetch_payload.py <URL or urls.txt>")
+        sys.exit(1)
+
+    arg = sys.argv[1]
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    summary_path = os.path.join(OUTPUT_DIR, "summary.csv")
+
+    # Single URL vs file of URLs
+    if arg.lower().endswith(".txt") and os.path.isfile(arg):
+        with open(arg, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    else:
+        urls = [arg]
+
+    with open(summary_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Input URL", "Status Code", "Final URL", "Redirect Chain", "Saved File"])
+        for url in urls:
+            fetch_and_save(url, writer)
+
+    print(f"\nDone. Summary -> {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
