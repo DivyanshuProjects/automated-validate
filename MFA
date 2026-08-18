@@ -1,9 +1,29 @@
+"""
+MFA Implementation Audit Tool (v4 - Fast + Robust)
+------------------------------------------------------
+Improvements over v3:
+  - BLANK URLs -> silently skipped, script seedha next URL pe chali jaati hai
+    (na error dikhega, na report me row banegi)
+  - HTTP + HTTPS dono try hote hain -> agar https fail ho jaye (ya scheme
+    diya hi na ho), automatically http try karta hai
+  - FAST -> concurrent requests (ek sath multiple URLs check hote hain,
+    ThreadPoolExecutor se) + connection pooling (Session reuse)
+  - REDIRECT CHAIN column -> poora path dikhata hai (A -> B -> C)
+  - Naya "Initial Status" aur "Final Status" dono column me
+  - Har tarah ka crash (malformed URL, GUID, junk row) safely handle hota hai
+
+USAGE:
+    python mfa_audit_v4.py
+"""
+
 import os
 import re
 import sys
 import csv as csv_module
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+from requests.adapters import HTTPAdapter
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -56,12 +76,18 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
-TIMEOUT = 15
+TIMEOUT = 8            # kept low on purpose -> speed. Increase if your network is slow.
 VERIFY_SSL = True
+MAX_WORKERS = 15        # kitne URLs ek sath (parallel) check honge
+
+# ---- Session with connection pooling (much faster for bulk runs) ----
+_session = requests.Session()
+_adapter = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=0)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
 
 def word_boundary_search(keyword: str, text_lower: str):
-    """Match only standalone occurrences, not substrings inside minified JS/CSS blobs."""
     pattern = r'(?<![a-z0-9])' + re.escape(keyword.lower()) + r'(?![a-z0-9])'
     return re.search(pattern, text_lower) is not None
 
@@ -85,9 +111,23 @@ def detect_provider(body_text: str, final_url: str):
     return None, [], "Not Detected", "-"
 
 
-def fetch(url: str):
+def is_valid_url_format(candidate: str) -> bool:
+    """Reject junk rows (GUIDs, plain text, blanks) before wasting a network call."""
+    if not candidate or len(candidate) > 2000:
+        return False
+    if " " in candidate or "\t" in candidate:
+        return False
+    if "." not in candidate:
+        return False
+    if not re.match(r'^[a-zA-Z0-9.\-_:/?=&%#@+~]+$', candidate):
+        return False
+    return True
+
+
+def raw_fetch(url: str):
+    """One HTTP(S) attempt. Returns (resp, error_str)."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+        resp = _session.get(url, headers=HEADERS, timeout=TIMEOUT,
                              allow_redirects=True, verify=VERIFY_SSL)
         return resp, None
     except requests.exceptions.SSLError as e:
@@ -98,25 +138,62 @@ def fetch(url: str):
         return None, "Timeout"
     except requests.exceptions.RequestException as e:
         return None, str(e)
+    except Exception as e:
+        return None, f"Unexpected error ({type(e).__name__}): {e}"
 
 
-def check_single_url(url: str):
-    """Fetch one URL and return a result dict."""
-    if not url.startswith("http"):
-        url = "https://" + url
+def fetch_with_fallback(raw_url: str):
+    """
+    Tries the URL as given. If it already has a scheme (http/https), only that
+    is tried. If NO scheme given, tries https first, then falls back to http
+    if https fails completely (many internal/legacy portals are http-only).
+    """
+    raw_url = raw_url.strip()
 
-    resp, err = fetch(url)
+    if raw_url.startswith("http://") or raw_url.startswith("https://"):
+        if not is_valid_url_format(raw_url):
+            return None, "Invalid URL format (skipped)", raw_url
+        resp, err = raw_fetch(raw_url)
+        return resp, err, raw_url
+
+    # No scheme given -> try https then http
+    https_url = "https://" + raw_url
+    if not is_valid_url_format(https_url):
+        return None, "Invalid URL format (skipped)", https_url
+
+    resp, err = raw_fetch(https_url)
+    if resp is not None:
+        return resp, None, https_url
+
+    http_url = "http://" + raw_url
+    resp2, err2 = raw_fetch(http_url)
+    if resp2 is not None:
+        return resp2, None, http_url
+
+    # both failed -> report the https error (usually more informative)
+    return None, err or err2, https_url
+
+
+def check_single_url(raw_url: str):
+    resp, err, attempted_url = fetch_with_fallback(raw_url)
+
     if err:
         return {
-            "url": url, "status_code": "ERROR", "final_url": "",
-            "provider": "", "keywords": err, "verdict": "Fetch Failed", "confidence": "-"
+            "url": attempted_url, "status_code": "ERROR", "final_url": "",
+            "redirect_chain": "", "provider": "-", "keywords": err,
+            "verdict": "Fetch Failed", "confidence": "-"
         }
+
+    redirect_chain = " -> ".join([f"{r.status_code}:{r.url}" for r in resp.history] +
+                                  [f"{resp.status_code}:{resp.url}"])
+    initial_status = resp.history[0].status_code if resp.history else resp.status_code
 
     provider, keywords, verdict, confidence = detect_provider(resp.text, resp.url)
     return {
-        "url": url,
-        "status_code": resp.status_code,
+        "url": attempted_url,
+        "status_code": f"{initial_status} -> {resp.status_code}" if resp.history else str(resp.status_code),
         "final_url": resp.url,
+        "redirect_chain": redirect_chain,
         "provider": provider or "-",
         "keywords": ", ".join(keywords) if keywords else "-",
         "verdict": verdict,
@@ -131,6 +208,7 @@ def print_terminal_result(r: dict):
     print(f"  URL              : {r['url']}")
     print(f"  Status Code      : {r['status_code']}")
     print(f"  Final URL        : {r['final_url']}")
+    print(f"  Redirect Chain   : {r['redirect_chain']}")
     print(f"  Detected Provider: {r['provider']}")
     print(f"  Matched Keywords : {r['keywords']}")
     print(f"  Confidence       : {r['confidence']}")
@@ -142,6 +220,7 @@ def print_terminal_result(r: dict):
 # ---------------- Bulk file reading ----------------
 
 def read_urls_from_file(input_path: str):
+    """Reads URLs from txt/csv/xlsx. Blank rows are dropped right here."""
     urls = []
     ext = input_path.lower().rsplit(".", 1)[-1]
 
@@ -152,8 +231,9 @@ def read_urls_from_file(input_path: str):
         col_idx = header.index("url") if "url" in header else 0
         start_row = 2 if "url" in header else 1
         for row in ws.iter_rows(min_row=start_row, values_only=True):
-            if row[col_idx]:
-                urls.append(str(row[col_idx]).strip())
+            val = row[col_idx] if row and len(row) > col_idx else None
+            if val and str(val).strip():
+                urls.append(str(val).strip())
 
     elif ext == "csv":
         with open(input_path, "r", encoding="utf-8-sig", newline="") as f:
@@ -169,7 +249,7 @@ def read_urls_from_file(input_path: str):
             col_idx = 0
             data_rows = rows
         for row in data_rows:
-            if row and row[col_idx].strip():
+            if row and len(row) > col_idx and row[col_idx].strip():
                 urls.append(row[col_idx].strip())
 
     else:  # txt
@@ -187,7 +267,7 @@ def write_excel_report(results, output_path):
     ws = wb.active
     ws.title = "MFA Audit"
 
-    headers = ["#", "URL", "Status Code", "Final URL (after redirect)",
+    headers = ["#", "URL", "Status Code", "Final URL (after redirect)", "Redirect Chain",
                "Detected Provider", "Matched Keywords / Notes", "Verdict", "Confidence"]
     ws.append(headers)
 
@@ -207,16 +287,16 @@ def write_excel_report(results, output_path):
     }
 
     for idx, r in enumerate(results, 1):
-        row = [idx, r["url"], r["status_code"], r["final_url"],
+        row = [idx, r["url"], r["status_code"], r["final_url"], r["redirect_chain"],
                r["provider"], r["keywords"], r["verdict"], r["confidence"]]
         ws.append(row)
-        cell = ws.cell(row=idx + 1, column=7)
+        cell = ws.cell(row=idx + 1, column=8)
         fill_color = verdict_colors.get(r["verdict"], "FFFFFF")
         cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
         for col in range(1, len(headers) + 1):
             ws.cell(row=idx + 1, column=col).font = Font(name="Arial", size=10)
 
-    widths = [5, 40, 12, 45, 28, 45, 15, 12]
+    widths = [5, 35, 15, 40, 45, 28, 40, 15, 12]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -225,13 +305,13 @@ def write_excel_report(results, output_path):
 
 
 def write_csv_report(results, output_path):
-    headers = ["#", "URL", "Status Code", "Final URL (after redirect)",
+    headers = ["#", "URL", "Status Code", "Final URL (after redirect)", "Redirect Chain",
                "Detected Provider", "Matched Keywords / Notes", "Verdict", "Confidence"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv_module.writer(f)
         writer.writerow(headers)
         for idx, r in enumerate(results, 1):
-            writer.writerow([idx, r["url"], r["status_code"], r["final_url"],
+            writer.writerow([idx, r["url"], r["status_code"], r["final_url"], r["redirect_chain"],
                               r["provider"], r["keywords"], r["verdict"], r["confidence"]])
 
 
@@ -241,15 +321,32 @@ def run_bulk(input_path: str, output_format: str, output_path: str):
         print("No URLs found in input file.")
         return
 
-    results = []
-    for i, url in enumerate(urls, 1):
-        print(f"[{i}/{len(urls)}] Checking {url} ...")
-        results.append(check_single_url(url))
+    total = len(urls)
+    print(f"Total URLs to check: {total}  (running {MAX_WORKERS} at a time)\n")
 
-    if output_format == "excel":
-        write_excel_report(results, output_path)
-    else:
+    results = [None] * total
+    done_count = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_idx = {executor.submit(check_single_url, url): i for i, url in enumerate(urls)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                results[idx] = {
+                    "url": urls[idx], "status_code": "SKIPPED", "final_url": "",
+                    "redirect_chain": "", "provider": "-", "keywords": str(e),
+                    "verdict": "Skipped", "confidence": "-"
+                }
+            done_count += 1
+            if done_count % 10 == 0 or done_count == total:
+                print(f"  [{done_count}/{total}] processed ...")
+
+    if output_format == "csv":
         write_csv_report(results, output_path)
+    else:
+        write_excel_report(results, output_path)
 
     print(f"\nDone. Report saved to {output_path}")
 
@@ -258,7 +355,7 @@ def run_bulk(input_path: str, output_format: str, output_path: str):
 
 def main():
     print("=" * 60)
-    print("  MFA IMPLEMENTATION AUDIT TOOL")
+    print("  MFA IMPLEMENTATION AUDIT TOOL (v4 - Fast)")
     print("=" * 60)
     print("  1. Single URL   (result terminal par dikhega)")
     print("  2. Bulk file    (txt / csv / xlsx -> Excel ya CSV report)")
